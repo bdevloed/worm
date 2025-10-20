@@ -1,0 +1,577 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OPTIND=1
+remote_port=8890
+VERBOSE=false
+TUNNEL_OTHER=false
+TUNNEL_STATE_DIR="${HOME}/.cache/worm/tunnels"
+CADDY_CONFIG_DIR="${HOME}/.cache/worm/caddy"
+HOSTS_MARKER_START="# worm-tunnels-start"
+HOSTS_MARKER_END="# worm-tunnels-end"
+
+mkdir -p "$TUNNEL_STATE_DIR"
+mkdir -p "$CADDY_CONFIG_DIR"
+
+# Setup SSH connection multiplexing to avoid connection limits
+SSH_CONTROL_DIR="${HOME}/.cache/worm/ssh-control"
+mkdir -p "$SSH_CONTROL_DIR"
+export SSH_OPTS="-o ControlMaster=auto -o ControlPath=${SSH_CONTROL_DIR}/%r@%h:%p -o ControlPersist=300"
+
+print_help() {
+    echo "Open a tunnel to a specific container with Caddy reverse proxy"
+    echo
+    echo "Syntax: [-r|v|o|h] <ssh-addr> <project-name> [container-name]"
+    echo "options:"
+    echo "o     Choose from OTHER services in the project (interactive selection)"
+    echo "r     The exposed port on the remote container you want to tunnel to, default 8890"
+    echo "v     Enable verbose logging for debugging"
+    echo "h     Print this Help."
+    echo
+    echo "Default mode (with container-name):"
+    echo "  Creates domain alias: <project-name>.<ssh-addr>.localhost"
+    echo "  Accessible via: http://<project-name>.<ssh-addr>.localhost (no port needed!)"
+    echo
+    echo "Other service mode (-o):"
+    echo "  Creates domain alias: <service>.<project-name>.<ssh-addr>.localhost:<exposed-port>"
+    echo "  Interactive selection of available services"
+}
+
+while getopts ":hvr:o" option; do
+    case $option in
+        h)
+            print_help
+            exit 0
+            ;;
+        o) TUNNEL_OTHER=true ;;
+        v) VERBOSE=true ;;
+        r) remote_port=$OPTARG ;;
+        \?)
+            echo "Error: Invalid option"
+            print_help
+            exit 1
+            ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[ "${1:-}" = "--" ] && shift
+
+SSH_ADDR=${1:-}
+PROJECT=${2:-}
+CONTAINER=${3:-virtuoso}
+
+if [ -z "$SSH_ADDR" ]; then
+   echo "missing required argument ssh-addr"
+   print_help
+   exit 1
+fi
+
+if [ -z "$PROJECT" ]; then
+   echo "missing required argument project-name"
+   print_help
+   exit 1
+fi
+
+# If -o flag is set, show service selection
+if [ "$TUNNEL_OTHER" = true ]; then
+    echo "Finding available services for project: $PROJECT on $SSH_ADDR..."
+
+    # Get all services
+    services=$(ssh -n "$SSH_ADDR" "docker ps --filter 'label=com.docker.compose.project=$PROJECT' --format '{{.Label \"com.docker.compose.service\"}}'" | sort -u)
+
+    if [ -z "$services" ]; then
+        echo "Error: No services found for project=$PROJECT"
+        exit 1
+    fi
+
+    # Use fzf to select a service
+    if command -v fzf >/dev/null 2>&1; then
+        CONTAINER=$(echo "$services" | fzf --prompt="Select service > " --height=40%)
+        if [ -z "$CONTAINER" ]; then
+            echo "No service selected, exiting."
+            exit 0
+        fi
+    else
+        # Fallback to numbered selection if fzf is not available
+        echo ""
+        echo "Available services:"
+        echo "$services" | nl
+        echo ""
+        read -p "Select service number: " service_num
+        CONTAINER=$(echo "$services" | sed -n "${service_num}p")
+        if [ -z "$CONTAINER" ]; then
+            echo "Invalid selection"
+            exit 1
+        fi
+    fi
+
+    echo "Selected service: $CONTAINER"
+    echo ""
+fi
+
+# Logging helper
+log_verbose() {
+    if [ "$VERBOSE" = true ]; then
+        echo "[DEBUG] $*" >&2
+    fi
+}
+
+# Find available port (starting from 8890, virtuoso always gets 8890)
+find_available_port() {
+    local preferred_port=$1
+    if ! lsof -Pi :$preferred_port -sTCP:LISTEN -t >/dev/null 2>&1; then
+        echo $preferred_port
+        return
+    fi
+
+    local port=$((preferred_port + 1))
+    while lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; do
+        port=$((port + 1))
+    done
+    echo $port
+}
+
+# Arrays to store tunnel data
+declare -a TUNNEL_PIDS=()
+declare -a TUNNEL_INFO=()
+declare -a TUNNEL_CMDS=()
+declare -a TUNNEL_DOMAINS=()
+
+# Ensure Caddy is running
+ensure_caddy() {
+    if ! docker ps --filter "name=worm-caddy" --filter "status=running" | grep -q worm-caddy; then
+        echo "Starting Caddy reverse proxy..."
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        log_verbose "Script directory: $SCRIPT_DIR"
+        cd "$SCRIPT_DIR"
+        docker compose up -d caddy
+        sleep 2
+    else
+        log_verbose "Caddy already running"
+    fi
+}
+
+# Get all containers for a project or a specific container
+get_containers_info() {
+    local project=$1
+    local service=${2:-}
+
+    if [ -n "$service" ]; then
+        # Single container mode
+        ssh_cmd="docker ps --filter 'label=com.docker.compose.project=$project' --filter 'label=com.docker.compose.service=$service' --format '{{.Names}}|{{.Label \"com.docker.compose.service\"}}'"
+    else
+        # All containers mode
+        ssh_cmd="docker ps --filter 'label=com.docker.compose.project=$project' --format '{{.Names}}|{{.Label \"com.docker.compose.service\"}}'"
+    fi
+
+    log_verbose "SSH command: ssh $SSH_OPTS -n $SSH_ADDR \"$ssh_cmd\""
+    ssh $SSH_OPTS -n "$SSH_ADDR" "$ssh_cmd"
+}
+
+# Get container IP and exposed ports
+get_container_details() {
+    local container_name=$1
+
+    # Get container IP (use -n to prevent stdin consumption in loops)
+    local ip_cmd="docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' $container_name | head -n1"
+    log_verbose "Getting IP: ssh $SSH_OPTS -n $SSH_ADDR \"$ip_cmd\""
+    local container_ip=$(ssh $SSH_OPTS -n "$SSH_ADDR" "$ip_cmd" 2>/dev/null | tr -d '[:space:]')
+
+    # Get exposed ports (EXPOSE directive, not published ports)
+    local ports_cmd="docker inspect -f '{{range \$p, \$conf := .Config.ExposedPorts}}{{printf \"%s\\n\" \$p}}{{end}}' $container_name"
+    log_verbose "Getting ports: ssh $SSH_OPTS -n $SSH_ADDR \"$ports_cmd\""
+    local exposed_ports=$(ssh $SSH_OPTS -n "$SSH_ADDR" "$ports_cmd" 2>/dev/null | sed 's|/tcp||g' | sed 's|/udp||g' | tr '\n' ' ')
+
+    # If no exposed ports found, prompt user with default of 80
+    if [ -z "$exposed_ports" ] || [ "$exposed_ports" = " " ]; then
+        log_verbose "No EXPOSE directive found for $container_name"
+        exposed_ports=""
+    fi
+
+    echo "$container_ip|$exposed_ports"
+}
+
+# Prompt user to select a port from multiple options
+select_port() {
+    local ports=$1
+    local service_name=$2
+
+    # Convert space-separated ports to array
+    local ports_array=($ports)
+    local port_count=${#ports_array[@]}
+
+    # If only one port, return it
+    if [ $port_count -eq 1 ]; then
+        echo "${ports_array[0]}"
+        return
+    fi
+
+    # Multiple ports - use fzf if available
+    if command -v fzf >/dev/null 2>&1; then
+        # Add "other" option to the list
+        local port_options=$(echo -e "${ports// /\\n}\nother (enter custom port)")
+        local selected_port=$(echo "$port_options" | fzf --prompt="Select port for $service_name > " --height=40%)
+
+        if [ -z "$selected_port" ]; then
+            echo "No port selected, using first port: ${ports_array[0]}" >&2
+            echo "${ports_array[0]}"
+        elif [ "$selected_port" = "other (enter custom port)" ]; then
+            read -p "Enter custom port: " custom_port </dev/tty
+            echo "$custom_port"
+        else
+            echo "$selected_port"
+        fi
+    else
+        # Fallback to numbered selection if fzf is not available
+        echo "" >&2
+        echo "Multiple ports exposed for service '$service_name':" >&2
+        echo "$ports" | tr ' ' '\n' | nl >&2
+        echo "" >&2
+        read -p "Select port number (or enter custom port): " port_selection </dev/tty
+
+        # Check if it's a number selection or custom port
+        if [[ "$port_selection" =~ ^[0-9]+$ ]] && [ "$port_selection" -le "$port_count" ] && [ "$port_selection" -gt 0 ]; then
+            # It's a selection from the list
+            echo "${ports_array[$((port_selection - 1))]}"
+        else
+            # It's a custom port number
+            echo "$port_selection"
+        fi
+    fi
+}
+
+# Discover containers
+if [ "$TUNNEL_OTHER" = true ]; then
+    echo "Finding container for project: $PROJECT, service: $CONTAINER on $SSH_ADDR..."
+    containers_data=$(get_containers_info "$PROJECT" "$CONTAINER")
+else
+    echo "Finding container for project: $PROJECT, service: $CONTAINER on $SSH_ADDR..."
+    containers_data=$(get_containers_info "$PROJECT" "$CONTAINER")
+fi
+
+if [ -z "$containers_data" ]; then
+    echo "No container found for project=$PROJECT, service=$CONTAINER"
+    echo ""
+    read -p "Would you like to select from available services instead? [Y/n]: " response
+    response=${response:-Y}
+
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        echo "Finding available services for project: $PROJECT on $SSH_ADDR..."
+
+        # Get all services
+        services=$(ssh $SSH_OPTS -n "$SSH_ADDR" "docker ps --filter 'label=com.docker.compose.project=$PROJECT' --format '{{.Label \"com.docker.compose.service\"}}'" | sort -u)
+
+        if [ -z "$services" ]; then
+            echo "Error: No services found for project=$PROJECT"
+            exit 1
+        fi
+
+        # Use fzf to select a service
+        if command -v fzf >/dev/null 2>&1; then
+            CONTAINER=$(echo "$services" | fzf --prompt="Select service > " --height=40%)
+            if [ -z "$CONTAINER" ]; then
+                echo "No service selected, exiting."
+                exit 0
+            fi
+        else
+            # Fallback to numbered selection if fzf is not available
+            echo ""
+            echo "Available services:"
+            echo "$services" | nl
+            echo ""
+            read -p "Select service number: " service_num
+            CONTAINER=$(echo "$services" | sed -n "${service_num}p")
+            if [ -z "$CONTAINER" ]; then
+                echo "Invalid selection"
+                exit 1
+            fi
+        fi
+
+        echo "Selected service: $CONTAINER"
+        echo ""
+
+        # Re-enable TUNNEL_OTHER mode since we're selecting from available services
+        TUNNEL_OTHER=true
+
+        # Try to find the container again with the selected service
+        echo "Finding container for project: $PROJECT, service: $CONTAINER on $SSH_ADDR..."
+        containers_data=$(get_containers_info "$PROJECT" "$CONTAINER")
+
+        if [ -z "$containers_data" ]; then
+            echo "Error: No container found for selected service=$CONTAINER"
+            exit 1
+        fi
+    else
+        echo "Exiting."
+        exit 1
+    fi
+fi
+
+# Prepare tunnel configuration (doesn't start SSH yet)
+prepare_tunnel() {
+    local container_name=$1
+    local service_name=$2
+    local container_ip=$3
+    local port=$4
+    local domain=""
+    local host_port=""
+
+    if [ "$TUNNEL_OTHER" = true ]; then
+        # Other service mode: <service>.<project>.<ssh>.localhost
+        # Remove common 'app-' prefix from project name
+        clean_project="${PROJECT#app-}"
+        domain="${service_name}.${clean_project}.${SSH_ADDR}.localhost"
+        # Map privileged ports (1-1024) to safe ports (8000+)
+        if [ "$port" -lt 1024 ]; then
+            # For privileged ports, map to 8000+ range
+            host_port=$(find_available_port $((8000 + port)))
+            log_verbose "Mapping privileged port $port to $host_port"
+        else
+            # Use the exposed port as-is for mapping
+            host_port=$(find_available_port "$port")
+        fi
+    else
+        # Default mode: <project>.<ssh>.localhost
+        # Remove common 'app-' prefix from project name
+        clean_project="${PROJECT#app-}"
+        domain="${clean_project}.${SSH_ADDR}.localhost"
+        # Virtuoso gets 8890, others get 8891+
+        if [ "$service_name" = "virtuoso" ]; then
+            host_port=$(find_available_port 8890)
+        else
+            host_port=$(find_available_port 8891)
+        fi
+        port="$remote_port"  # Use the -r argument if provided
+    fi
+
+    log_verbose "Preparing tunnel: $domain (${container_ip}:${port} -> localhost:${host_port})"
+
+    # Save tunnel state
+    local state_file="${TUNNEL_STATE_DIR}/${domain}.json"
+    cat > "$state_file" <<EOF
+{
+  "domain": "$domain",
+  "ssh_addr": "$SSH_ADDR",
+  "project": "$PROJECT",
+  "container": "$service_name",
+  "host_port": $host_port,
+  "remote_port": $port,
+  "container_ip": "$container_ip",
+  "container_name": "$container_name",
+  "pid": $$,
+  "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+
+    # Generate Caddy config for this domain
+    log_verbose "Generating Caddy config for: $domain -> localhost:$host_port"
+    cat > "${CADDY_CONFIG_DIR}/${domain}.caddy" <<EOF
+${domain} {
+    reverse_proxy localhost:${host_port}
+}
+EOF
+
+    # Store tunnel command to execute later
+    TUNNEL_CMDS+=("$host_port|$container_ip|$port")
+    TUNNEL_DOMAINS+=("$domain")
+
+    # Store info for display
+    if [ "$service_name" = "virtuoso" ]; then
+        TUNNEL_INFO+=("http://${domain}:${host_port}/sparql|$service_name|$container_name|${container_ip}:${port}")
+    else
+        TUNNEL_INFO+=("http://${domain}:${host_port}|$service_name|$container_name|${container_ip}:${port}")
+    fi
+
+    echo "  ✓ $service_name: http://${domain}:${host_port}"
+}
+
+# Regenerate main Caddyfile from all active tunnel configs
+update_caddy_config() {
+    local main_caddy="${CADDY_CONFIG_DIR}/Caddyfile"
+    log_verbose "Regenerating main Caddyfile at: $main_caddy"
+    cat > "$main_caddy" <<'HEADER'
+{
+    auto_https off
+    admin localhost:2019
+}
+
+# Catch-all health check
+:80 {
+    respond /health 200
+}
+
+HEADER
+
+    # Append all domain-specific configs
+    for caddy_conf in "${CADDY_CONFIG_DIR}"/*.caddy; do
+        if [ -f "$caddy_conf" ]; then
+            cat "$caddy_conf" >> "$main_caddy"
+            echo "" >> "$main_caddy"
+        fi
+    done
+
+    # Copy to Docker volume mount location
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    log_verbose "Copying Caddyfile to: ${SCRIPT_DIR}/Caddyfile"
+    cp "$main_caddy" "${SCRIPT_DIR}/Caddyfile"
+
+    # Reload Caddy config
+    if docker ps --filter "name=worm-caddy" --filter "status=running" | grep -q worm-caddy; then
+        log_verbose "Reloading Caddy configuration"
+        docker exec worm-caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+    fi
+}
+
+# Cleanup function
+cleanup() {
+    echo ""
+    echo "Closing all tunnels..."
+
+    # Kill all SSH tunnel processes
+    for pid in "${TUNNEL_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Remove state files and configs for this session
+    for domain in "${TUNNEL_DOMAINS[@]}"; do
+        rm -f "${TUNNEL_STATE_DIR}/${domain}.json"
+        rm -f "${CADDY_CONFIG_DIR}/${domain}.caddy"
+    done
+
+    update_caddy_config
+    echo "All tunnels closed."
+    exit 0
+}
+
+trap cleanup INT TERM
+
+# Ensure Caddy is running
+ensure_caddy
+
+# Process each container and create tunnels
+echo ""
+echo "Creating tunnels..."
+echo ""
+
+# Debug: Show how many containers we found
+container_count=$(echo "$containers_data" | wc -l)
+echo "Found $container_count containers to process"
+echo ""
+
+# Process each line - use a temp file to avoid subshell issues
+tmpfile="/tmp/worm-containers-$$"
+echo "$containers_data" > "$tmpfile"
+
+while IFS='|' read -r container_name service_name || [ -n "$container_name" ]; do
+    # Skip empty lines
+    if [ -z "$container_name" ]; then
+        continue
+    fi
+
+    echo "Processing $service_name ($container_name)..."
+
+    # Get container details (IP and exposed ports)
+    details=$(get_container_details "$container_name")
+    container_ip=$(echo "$details" | cut -d'|' -f1)
+    exposed_ports=$(echo "$details" | cut -d'|' -f2)
+
+    # If we couldn't get container IP, prompt user for it
+    if [ -z "$container_ip" ]; then
+        echo "  ⚠ Warning: Could not automatically detect IP for $container_name"
+        read -p "Enter container IP address (or 's' to skip): " container_ip </dev/tty
+        if [ "$container_ip" = "s" ] || [ -z "$container_ip" ]; then
+            echo "  Skipping $service_name"
+            continue
+        fi
+    fi
+
+    # Determine which port to use
+    selected_port=""
+
+    if [ "$TUNNEL_OTHER" = true ]; then
+        # Other service mode: prompt user to select port
+        if [ -z "$exposed_ports" ]; then
+            # No ports exposed, prompt with default of 80
+            echo "No ports exposed for service '$service_name'"
+            read -p "Enter port to connect to [default: 80]: " selected_port </dev/tty
+            selected_port=${selected_port:-80}
+        else
+            # Select from exposed ports (handles single or multiple)
+            selected_port=$(select_port "$exposed_ports" "$service_name")
+        fi
+        prepare_tunnel "$container_name" "$service_name" "$container_ip" "$selected_port"
+    else
+        # Default mode: use specified port from -r flag
+        prepare_tunnel "$container_name" "$service_name" "$container_ip" "$remote_port"
+    fi
+done < "$tmpfile"
+
+rm -f "$tmpfile"
+
+# Update Caddy config with all new tunnels
+update_caddy_config
+
+# Now start all SSH tunnels in the background
+echo ""
+echo "Starting SSH tunnels..."
+tunnel_count=0
+for tunnel_cmd in "${TUNNEL_CMDS[@]}"; do
+    IFS='|' read -r host_port container_ip port <<< "$tunnel_cmd"
+    log_verbose "Starting: ssh $SSH_ADDR -L ${host_port}:${container_ip}:${port} -N"
+
+    # Run SSH tunnel in background
+    # Note: Don't use ControlMaster for the tunnel itself, only for command execution
+    ssh "$SSH_ADDR" -L "${host_port}:${container_ip}:${port}" -N -o "ServerAliveInterval=60" -o "ControlMaster=no" </dev/null >/dev/null 2>&1 &
+    TUNNEL_PIDS+=($!)
+    tunnel_count=$((tunnel_count + 1))
+
+    # Small delay between connections to avoid overwhelming firewall
+    if [ $tunnel_count -lt ${#TUNNEL_CMDS[@]} ]; then
+        sleep 0.2
+    fi
+done
+
+echo "All SSH tunnels started (${#TUNNEL_PIDS[@]} total)"
+
+# Display summary
+echo ""
+echo "========================================="
+if [ "$TUNNEL_OTHER" = true ]; then
+    # Other service tunnel info
+    echo "✓ Service tunnel active: $CONTAINER"
+    echo "  SSH host: $SSH_ADDR"
+    echo "  Project: $PROJECT"
+    echo "  Tunnels created: ${#TUNNEL_INFO[@]}"
+    echo ""
+    echo "Active tunnel URLs:"
+    for info in "${TUNNEL_INFO[@]}"; do
+        url=$(echo "$info" | cut -d'|' -f1)
+        service=$(echo "$info" | cut -d'|' -f2)
+        container=$(echo "$info" | cut -d'|' -f3)
+        remote=$(echo "$info" | cut -d'|' -f4)
+        echo "  • $url"
+        log_verbose "    Container: $container ($remote)"
+    done
+else
+    # Default tunnel info
+    if [ ${#TUNNEL_INFO[@]} -gt 0 ]; then
+        info="${TUNNEL_INFO[0]}"
+        url=$(echo "$info" | cut -d'|' -f1)
+        service=$(echo "$info" | cut -d'|' -f2)
+        container=$(echo "$info" | cut -d'|' -f3)
+        remote=$(echo "$info" | cut -d'|' -f4)
+        echo "✓ Tunnel active: $url"
+        echo "  SSH host: $SSH_ADDR"
+        echo "  Container: $container ($remote)"
+    fi
+fi
+echo "========================================="
+echo ""
+echo "Press Ctrl+C to close all tunnels"
+echo ""
+
+# Wait for all background SSH tunnels (this blocks)
+wait

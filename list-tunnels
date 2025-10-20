@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TUNNEL_STATE_DIR="${HOME}/.cache/worm/tunnels"
+
+if [ ! -d "$TUNNEL_STATE_DIR" ] || [ -z "$(ls -A "$TUNNEL_STATE_DIR" 2>/dev/null)" ]; then
+    echo "No active tunnels"
+    exit 0
+fi
+
+echo "Active Tunnels:"
+echo "==============="
+echo ""
+
+for state_file in "$TUNNEL_STATE_DIR"/*.json; do
+    if [ -f "$state_file" ]; then
+        domain=$(grep -o '"domain": "[^"]*"' "$state_file" | cut -d'"' -f4)
+        port=$(grep -o '"host_port": [0-9]*' "$state_file" | awk '{print $2}')
+        ssh_addr=$(grep -o '"ssh_addr": "[^"]*"' "$state_file" | cut -d'"' -f4)
+        project=$(grep -o '"project": "[^"]*"' "$state_file" | cut -d'"' -f4)
+        container=$(grep -o '"container_name": "[^"]*"' "$state_file" | cut -d'"' -f4)
+
+        echo "• http://${domain}:${port}"
+        echo "  SSH: $ssh_addr | Project: $project | Container: $container"
+        echo ""
+    fi
+done

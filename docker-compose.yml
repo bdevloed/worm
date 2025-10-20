@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: worm-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - worm-network
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  worm-network:
+    name: worm-network
