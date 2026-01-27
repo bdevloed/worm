@@ -98,7 +98,35 @@ if [[ "$REFRESH" == true || ! -f "$cache_file" ]]; then
   echo "Cached projects for $selected_host"
   echo ""
 else
-  echo "Using cached projects for $selected_host"
+  # Calculate cache age
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS
+    cache_mod_time=$(stat -f %m "$cache_file" 2>/dev/null)
+  else
+    # Linux
+    cache_mod_time=$(stat -c %Y "$cache_file" 2>/dev/null)
+  fi
+
+  if [[ -n "$cache_mod_time" ]]; then
+    current_time=$(date +%s)
+    cache_age=$((current_time - cache_mod_time))
+    cache_age_minutes=$((cache_age / 60))
+    cache_age_hours=$((cache_age / 3600))
+
+    if [[ $cache_age_hours -gt 0 ]]; then
+      echo "Using cached projects for $selected_host (${cache_age_hours}h old)"
+    else
+      echo "Using cached projects for $selected_host (${cache_age_minutes}m old)"
+    fi
+
+    # Show refresh hint if cache is older than 1 hour
+    if [[ $cache_age -gt 3600 ]]; then
+      echo "Tip: Use --refresh to update the cache"
+    fi
+  else
+    echo "Using cached projects for $selected_host"
+  fi
+
   projects=$(<"$cache_file")
   echo ""
 fi
