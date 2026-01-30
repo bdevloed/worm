@@ -1,0 +1,8 @@
+services:
+  caddy:
+    network_mode: bridge
+    ports:
+      - "80:80"
+      - "443:443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

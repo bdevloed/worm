@@ -164,14 +164,49 @@ if [ "$TUNNEL_OTHER" = true ]; then
     echo ""
 fi
 
+# Detect if running on macOS
+is_macos() {
+    [[ "$OSTYPE" == "darwin"* ]]
+}
+
+# Get the appropriate localhost reference for Caddy
+# On macOS with Docker Desktop, containers need to use host.docker.internal
+get_proxy_host() {
+    if is_macos; then
+        echo "host.docker.internal"
+    else
+        echo "localhost"
+    fi
+}
+
 # Ensure Caddy is running
 ensure_caddy() {
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    log_verbose "Script directory: $SCRIPT_DIR"
+
+    # Ensure Caddyfile exists before starting Docker
+    local caddyfile="${SCRIPT_DIR}/Caddyfile"
+    if [ ! -f "$caddyfile" ]; then
+        echo "Creating initial Caddyfile..."
+        cat > "$caddyfile" <<'EOF'
+{
+    auto_https off
+    admin localhost:2019
+}
+EOF
+    fi
+
     if ! docker ps --filter "name=worm-caddy" --filter "status=running" | grep -q worm-caddy; then
         echo "Starting Caddy reverse proxy..."
-        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        log_verbose "Script directory: $SCRIPT_DIR"
         cd "$SCRIPT_DIR"
-        docker compose up -d caddy
+
+        # Use different docker-compose config for macOS vs Linux
+        if is_macos; then
+            # macOS: use port mappings (network_mode: host doesn't work)
+            docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d caddy 2>/dev/null || docker compose up -d caddy
+        else
+            docker compose up -d caddy
+        fi
 
         # Poll for Caddy readiness instead of fixed sleep
         log_verbose "Waiting for Caddy to be ready..."
@@ -405,7 +440,9 @@ EOF
 # Regenerate main Caddyfile from all active tunnel configs
 update_caddy_config() {
     local main_caddy="${CADDY_CONFIG_DIR}/Caddyfile"
-    log_verbose "Regenerating main Caddyfile at: $main_caddy"
+    local proxy_host=$(get_proxy_host)
+    log_verbose "Regenerating main Caddyfile at: $main_caddy (proxy_host: $proxy_host)"
+
     cat > "$main_caddy" <<'HEADER'
 {
     auto_https off
@@ -420,8 +457,10 @@ HEADER
             # Read the domain from the .caddy file and add :80
             domain=$(grep -m1 '^[a-zA-Z]' "$caddy_conf" | sed 's/ {//')
             if [ -n "$domain" ]; then
+                # Extract the port from the reverse_proxy line
+                port=$(grep 'reverse_proxy' "$caddy_conf" | sed 's/.*localhost:\([0-9]*\).*/\1/')
                 echo "${domain}:80 {" >> "$main_caddy"
-                grep -v '^[a-zA-Z].*{' "$caddy_conf" | grep -v '^}' >> "$main_caddy"
+                echo "    reverse_proxy ${proxy_host}:${port}" >> "$main_caddy"
                 echo "    respond /health 200" >> "$main_caddy"
                 echo "}" >> "$main_caddy"
                 echo "" >> "$main_caddy"
