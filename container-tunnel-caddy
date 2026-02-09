@@ -94,7 +94,7 @@ select_service_interactive() {
 }
 
 # Find available port (starting from 8890, virtuoso always gets 8890)
-# Checks LISTEN, TIME_WAIT, and ESTABLISHED states to avoid conflicts
+# Checks LISTEN and ESTABLISHED states to avoid conflicts
 find_available_port() {
     local preferred_port=$1
 
