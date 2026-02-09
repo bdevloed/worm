@@ -409,14 +409,6 @@ prepare_tunnel() {
 }
 EOF
 
-    # Generate Caddy config for this domain
-    log_verbose "Generating Caddy config for: $domain -> localhost:$host_port"
-    cat > "${CADDY_CONFIG_DIR}/${domain}.caddy" <<EOF
-${domain} {
-    reverse_proxy localhost:${host_port}
-}
-EOF
-
     # Store tunnel command to execute later (includes domain for state updates)
     TUNNEL_CMDS+=("$host_port|$container_ip|$port|$domain")
 
@@ -430,7 +422,7 @@ EOF
     echo "  ✓ $service_name: http://${domain}"
 }
 
-# Regenerate main Caddyfile from all active tunnel configs
+# Regenerate main Caddyfile from all active tunnel state files
 update_caddy_config() {
     local main_caddy="${CADDY_CONFIG_DIR}/Caddyfile"
     local proxy_host=$(get_proxy_host)
@@ -444,14 +436,12 @@ update_caddy_config() {
 
 HEADER
 
-    # Append all domain-specific configs with explicit :80 port
-    for caddy_conf in "${CADDY_CONFIG_DIR}"/*.caddy; do
-        if [ -f "$caddy_conf" ]; then
-            # Read the domain from the .caddy file and add :80
-            domain=$(grep -m1 '^[a-zA-Z]' "$caddy_conf" | sed 's/ {//')
-            if [ -n "$domain" ]; then
-                # Extract the port from the reverse_proxy line
-                port=$(grep 'reverse_proxy' "$caddy_conf" | sed 's/.*localhost:\([0-9]*\).*/\1/')
+    # Build Caddyfile entries from JSON state files
+    for state_file in "${TUNNEL_STATE_DIR}"/*.json; do
+        if [ -f "$state_file" ]; then
+            local domain=$(grep -o '"domain": "[^"]*"' "$state_file" | cut -d'"' -f4)
+            local port=$(grep -o '"host_port": [0-9]*' "$state_file" | awk '{print $2}')
+            if [ -n "$domain" ] && [ -n "$port" ]; then
                 echo "${domain}:80 {" >> "$main_caddy"
                 echo "    reverse_proxy ${proxy_host}:${port}" >> "$main_caddy"
                 echo "    respond /health 200" >> "$main_caddy"
@@ -491,10 +481,9 @@ cleanup() {
         fi
     done
 
-    # Remove state files and configs for this session
+    # Remove state files for this session
     for domain in "${TUNNEL_DOMAINS[@]}"; do
         rm -f "${TUNNEL_STATE_DIR}/${domain}.json"
-        rm -f "${CADDY_CONFIG_DIR}/${domain}.caddy"
     done
 
     update_caddy_config
