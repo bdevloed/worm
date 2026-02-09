@@ -47,12 +47,22 @@ done
 # --- Collect hosts from SSH config ---
 ALL_HOSTS=($(grep -E '^Host ' ~/.ssh/config | awk '{print $2}'))
 
-# Remove ignored hosts if ignore file exists
+# Remove ignored hosts if ignore file exists (exact match only)
 if [[ -f "$IGNORE_FILE" ]]; then
   IGNORED=($(<"$IGNORE_FILE"))
-  for ignore in "${IGNORED[@]}"; do
-    ALL_HOSTS=("${ALL_HOSTS[@]/$ignore}")
+  FILTERED_HOSTS=()
+  for host in "${ALL_HOSTS[@]}"; do
+    [[ -z "$host" ]] && continue
+    skip=false
+    for ignore in "${IGNORED[@]}"; do
+      if [[ "$host" == "$ignore" ]]; then
+        skip=true
+        break
+      fi
+    done
+    $skip || FILTERED_HOSTS+=("$host")
   done
+  ALL_HOSTS=("${FILTERED_HOSTS[@]}")
 fi
 
 # --- Step 1: Select host (single select) ---
