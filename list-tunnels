@@ -12,15 +12,35 @@ echo "Active Tunnels:"
 echo "==============="
 echo ""
 
+active=0
+stale=0
+
 for state_file in "$TUNNEL_STATE_DIR"/*.json; do
     if [ -f "$state_file" ]; then
         domain=$(grep -o '"domain": "[^"]*"' "$state_file" | cut -d'"' -f4)
         ssh_addr=$(grep -o '"ssh_addr": "[^"]*"' "$state_file" | cut -d'"' -f4)
         project=$(grep -o '"project": "[^"]*"' "$state_file" | cut -d'"' -f4)
         container=$(grep -o '"container_name": "[^"]*"' "$state_file" | cut -d'"' -f4)
+        ssh_pid=$(grep -o '"ssh_tunnel_pid": [0-9]*' "$state_file" | awk '{print $2}')
 
-        echo "• http://${domain}"
-        echo "  SSH: $ssh_addr | Project: $project | Container: $container"
-        echo ""
+        # Check if SSH tunnel process is still alive
+        if [ -n "$ssh_pid" ] && kill -0 "$ssh_pid" 2>/dev/null; then
+            echo "• http://${domain}"
+            echo "  SSH: $ssh_addr | Project: $project | Container: $container"
+            echo ""
+            active=$((active + 1))
+        else
+            # Stale state file — tunnel is dead
+            rm -f "$state_file"
+            stale=$((stale + 1))
+        fi
     fi
 done
+
+if [ $active -eq 0 ]; then
+    echo "No active tunnels"
+fi
+
+if [ $stale -gt 0 ]; then
+    echo "Cleaned up $stale stale tunnel(s)"
+fi
