@@ -2,6 +2,8 @@
 
 A tool to create SSH tunnels to Docker Compose containers with automatic Caddy reverse proxy setup, using `*.localhost` domains.
 
+Inspired by/built upon [kobemertens/worm](https://github.com/kobemertens/worm). This was also a vibe code experimemt. Issues/pr's welcome.
+
 ## Features
 
 - 🔌 SSH tunnels to remote Docker containers
