@@ -7,8 +7,6 @@ mkdir -p "$CACHE_DIR"
 
 REFRESH=false
 SEARCH=""
-PORTS=""
-P_ARG=""
 R_ARG=""
 V_ARG=""
 O_ARG=""
@@ -31,8 +29,8 @@ while [[ $# -gt 0 ]]; do
       V_ARG="-v"
       shift
       ;;
-    -p|--ports)
-      PORTS="$2"
+    -r|--remote-port)
+      R_ARG="-r $2"
       shift 2
       ;;
     -c|--container)
@@ -45,12 +43,6 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-
-# Handle ports if given
-if [[ -n "$PORTS" ]]; then
-  P_ARG="-p ${PORTS%%:*}"
-  R_ARG="-r ${PORTS##*:}"
-fi
 
 # --- Collect hosts from SSH config ---
 ALL_HOSTS=($(grep -E '^Host ' ~/.ssh/config | awk '{print $2}'))
@@ -183,7 +175,7 @@ if [[ -z "$selected_project" ]]; then
 fi
 
 # --- Step 5: Connect ---
-echo "Connecting to $selected_host, project: $selected_project $P_ARG $R_ARG ${V_ARG:+verbose mode} ${O_ARG:+choose service} ${CONTAINER:+container: $CONTAINER}"
+echo "Connecting to $selected_host, project: $selected_project ${R_ARG:+$R_ARG} ${V_ARG:+verbose mode} ${O_ARG:+choose service} ${CONTAINER:+container: $CONTAINER}"
 
 # Build args array to avoid empty string arguments
 args=()

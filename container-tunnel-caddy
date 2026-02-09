@@ -7,8 +7,6 @@ VERBOSE=false
 TUNNEL_OTHER=false
 TUNNEL_STATE_DIR="${HOME}/.cache/worm/tunnels"
 CADDY_CONFIG_DIR="${HOME}/.cache/worm/caddy"
-HOSTS_MARKER_START="# worm-tunnels-start"
-HOSTS_MARKER_END="# worm-tunnels-end"
 
 mkdir -p "$TUNNEL_STATE_DIR"
 mkdir -p "$CADDY_CONFIG_DIR"
@@ -319,13 +317,8 @@ select_port() {
 }
 
 # Discover containers
-if [ "$TUNNEL_OTHER" = true ]; then
-    echo "Finding container for project: $PROJECT, service: $CONTAINER on $SSH_ADDR..."
-    containers_data=$(get_containers_info "$PROJECT" "$CONTAINER")
-else
-    echo "Finding container for project: $PROJECT, service: $CONTAINER on $SSH_ADDR..."
-    containers_data=$(get_containers_info "$PROJECT" "$CONTAINER")
-fi
+echo "Finding container for project: $PROJECT, service: $CONTAINER on $SSH_ADDR..."
+containers_data=$(get_containers_info "$PROJECT" "$CONTAINER")
 
 if [ -z "$containers_data" ]; then
     echo "No container found for project=$PROJECT, service=$CONTAINER"
