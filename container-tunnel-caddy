@@ -604,7 +604,11 @@ for tunnel_cmd in "${TUNNEL_CMDS[@]}"; do
         state_file="${TUNNEL_STATE_DIR}/${domain}.json"
         if [ -f "$state_file" ]; then
             # Use sed to update the ssh_tunnel_pid field
-            sed -i "s/\"ssh_tunnel_pid\": null/\"ssh_tunnel_pid\": $pid/" "$state_file"
+            if is_macos; then
+                sed -i '' "s/\"ssh_tunnel_pid\": null/\"ssh_tunnel_pid\": $pid/" "$state_file"
+            else
+                sed -i "s/\"ssh_tunnel_pid\": null/\"ssh_tunnel_pid\": $pid/" "$state_file"
+            fi
             log_verbose "  Updated state file with SSH PID: $state_file"
         fi
     else
