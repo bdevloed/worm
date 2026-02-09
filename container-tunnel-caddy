@@ -201,7 +201,10 @@ EOF
         # Use different docker-compose config for macOS vs Linux
         if is_macos; then
             # macOS: use port mappings (network_mode: host doesn't work)
-            docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d caddy 2>/dev/null || docker compose up -d caddy
+            # Pull with base config only — Docker Desktop has a bug where
+            # pulling with merged -f flags fails to register the image
+            docker compose pull caddy
+            docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d caddy
         else
             docker compose up -d caddy
         fi
