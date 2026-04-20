@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TUNNEL_STATE_DIR="${HOME}/.cache/worm/tunnels"
+SOCKET_DIR="${HOME}/.cache/worm/sockets"
+CADDYFILE="${SCRIPT_DIR}/Caddyfile"
 
 if [ ! -d "$TUNNEL_STATE_DIR" ] || [ -z "$(ls -A "$TUNNEL_STATE_DIR" 2>/dev/null)" ]; then
     echo "No active tunnels"
@@ -17,11 +20,14 @@ stale=0
 
 for state_file in "$TUNNEL_STATE_DIR"/*.json; do
     if [ -f "$state_file" ]; then
-        domain=$(grep -o '"domain": "[^"]*"' "$state_file" | cut -d'"' -f4)
-        ssh_addr=$(grep -o '"ssh_addr": "[^"]*"' "$state_file" | cut -d'"' -f4)
-        project=$(grep -o '"project": "[^"]*"' "$state_file" | cut -d'"' -f4)
-        container=$(grep -o '"container_name": "[^"]*"' "$state_file" | cut -d'"' -f4)
-        ssh_pid=$(grep -o '"ssh_tunnel_pid": [0-9]*' "$state_file" | awk '{print $2}')
+        # `|| true` on each: grep exits 1 when a field is absent (e.g. legacy
+        # state files predating ssh_tunnel_pid) and set -e + pipefail would kill
+        # the script otherwise.
+        domain=$(grep -o '"domain": "[^"]*"' "$state_file" | cut -d'"' -f4 || true)
+        ssh_addr=$(grep -o '"ssh_addr": "[^"]*"' "$state_file" | cut -d'"' -f4 || true)
+        project=$(grep -o '"project": "[^"]*"' "$state_file" | cut -d'"' -f4 || true)
+        container=$(grep -o '"container_name": "[^"]*"' "$state_file" | cut -d'"' -f4 || true)
+        ssh_pid=$(grep -o '"ssh_tunnel_pid": [0-9]*' "$state_file" | awk '{print $2}' || true)
 
         # Check if SSH tunnel process is still alive
         if [ -n "$ssh_pid" ] && kill -0 "$ssh_pid" 2>/dev/null; then
@@ -30,8 +36,8 @@ for state_file in "$TUNNEL_STATE_DIR"/*.json; do
             echo ""
             active=$((active + 1))
         else
-            # Stale state file — tunnel is dead
-            rm -f "$state_file"
+            # Stale state file — tunnel is dead. Drop the socket too.
+            rm -f "$state_file" "${SOCKET_DIR}/${domain}.sock"
             stale=$((stale + 1))
         fi
     fi
@@ -43,4 +49,34 @@ fi
 
 if [ $stale -gt 0 ]; then
     echo "Cleaned up $stale stale tunnel(s)"
+
+    # Regenerate Caddyfile so Caddy stops proxying to the dead sockets.
+    # Keep in sync with container-tunnel-caddy:update_caddy_config.
+    {
+        cat <<'HEADER'
+{
+    auto_https off
+    admin localhost:2019
+}
+
+HEADER
+        for state_file in "$TUNNEL_STATE_DIR"/*.json; do
+            [ -f "$state_file" ] || continue
+            domain=$(grep -o '"domain": "[^"]*"' "$state_file" | cut -d'"' -f4 || true)
+            [ -n "$domain" ] || continue
+            cat <<EOF
+${domain}:80 {
+    reverse_proxy unix//sockets/${domain}.sock
+    respond /health 200
+}
+
+EOF
+        done
+    } > "$CADDYFILE"
+
+    if docker ps --filter "name=worm-caddy" --filter "status=running" -q 2>/dev/null | grep -q .; then
+        docker exec worm-caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+    fi
 fi
+
+exit 0

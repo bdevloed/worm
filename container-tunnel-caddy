@@ -7,9 +7,11 @@ VERBOSE=false
 TUNNEL_OTHER=false
 TUNNEL_STATE_DIR="${HOME}/.cache/worm/tunnels"
 CADDY_CONFIG_DIR="${HOME}/.cache/worm/caddy"
+SOCKET_DIR="${HOME}/.cache/worm/sockets"
 
 mkdir -p "$TUNNEL_STATE_DIR"
 mkdir -p "$CADDY_CONFIG_DIR"
+mkdir -p "$SOCKET_DIR"
 
 # Setup SSH connection multiplexing to avoid connection limits
 SSH_CONTROL_DIR="${HOME}/.cache/worm/ssh-control"
@@ -93,27 +95,6 @@ select_service_interactive() {
     return 0
 }
 
-# Find available port (starting from 8890, virtuoso always gets 8890)
-# Checks LISTEN and ESTABLISHED states to avoid conflicts
-find_available_port() {
-    local preferred_port=$1
-
-    # Check if preferred port is available (check all TCP states)
-    if ! lsof -Pi :$preferred_port -sTCP:LISTEN -t >/dev/null 2>&1 && \
-       ! lsof -Pi :$preferred_port -sTCP:ESTABLISHED -t >/dev/null 2>&1; then
-        echo $preferred_port
-        return
-    fi
-
-    # Find next available port
-    local port=$((preferred_port + 1))
-    while lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1 || \
-          lsof -Pi :$port -sTCP:ESTABLISHED -t >/dev/null 2>&1; do
-        port=$((port + 1))
-    done
-    echo $port
-}
-
 # ===== END FUNCTION DEFINITIONS =====
 
 while getopts ":hvr:o" option; do
@@ -165,16 +146,6 @@ fi
 # Detect if running on macOS
 is_macos() {
     [[ "$OSTYPE" == "darwin"* ]]
-}
-
-# Get the appropriate localhost reference for Caddy
-# On macOS with Docker Desktop, containers need to use host.docker.internal
-get_proxy_host() {
-    if is_macos; then
-        echo "host.docker.internal"
-    else
-        echo "localhost"
-    fi
 }
 
 # Ensure Caddy is running
@@ -361,38 +332,19 @@ prepare_tunnel() {
     local service_name=$2
     local container_ip=$3
     local port=$4
-    local domain=""
-    local host_port=""
 
+    local clean_project="${PROJECT#app-}"
+    local domain
     if [ "$TUNNEL_OTHER" = true ]; then
-        # Other service mode: <service>.<project>.<ssh>.localhost
-        # Remove common 'app-' prefix from project name
-        clean_project="${PROJECT#app-}"
         domain="${service_name}.${clean_project}.${SSH_ADDR}.localhost"
-        # Map privileged ports (1-1024) to safe ports (8000+)
-        if [ "$port" -lt 1024 ]; then
-            # For privileged ports, map to 8000+ range
-            host_port=$(find_available_port $((8000 + port)))
-            log_verbose "Mapping privileged port $port to $host_port"
-        else
-            # Use the exposed port as-is for mapping
-            host_port=$(find_available_port "$port")
-        fi
     else
-        # Default mode: <project>.<ssh>.localhost
-        # Remove common 'app-' prefix from project name
-        clean_project="${PROJECT#app-}"
         domain="${clean_project}.${SSH_ADDR}.localhost"
-        # Virtuoso gets 8890, others get 8891+
-        if [ "$service_name" = "virtuoso" ]; then
-            host_port=$(find_available_port 8890)
-        else
-            host_port=$(find_available_port 8891)
-        fi
-        port="$remote_port"  # Use the -r argument if provided
+        port="$remote_port"
     fi
 
-    log_verbose "Preparing tunnel: $domain (${container_ip}:${port} -> localhost:${host_port})"
+    local sock_path="${SOCKET_DIR}/${domain}.sock"
+
+    log_verbose "Preparing tunnel: $domain (${container_ip}:${port} -> ${sock_path})"
 
     # Save tunnel state (SSH PID will be updated after tunnel starts)
     local state_file="${TUNNEL_STATE_DIR}/${domain}.json"
@@ -402,7 +354,7 @@ prepare_tunnel() {
   "ssh_addr": "$SSH_ADDR",
   "project": "$PROJECT",
   "container": "$service_name",
-  "host_port": $host_port,
+  "socket_path": "$sock_path",
   "remote_port": $port,
   "container_ip": "$container_ip",
   "container_name": "$container_name",
@@ -412,14 +364,12 @@ prepare_tunnel() {
 }
 EOF
 
-    # Store tunnel command to execute later (includes domain for state updates)
-    TUNNEL_CMDS+=("$host_port|$container_ip|$port|$domain")
+    TUNNEL_CMDS+=("$sock_path|$container_ip|$port|$domain")
 
-    # Store info for display (no port - routing through Caddy on :80)
     if [ "$service_name" = "virtuoso" ]; then
-        TUNNEL_INFO+=("http://${domain}/sparql|$service_name|$container_name|${container_ip}:${port}|${host_port}")
+        TUNNEL_INFO+=("http://${domain}/sparql|$service_name|$container_name|${container_ip}:${port}|${sock_path}")
     else
-        TUNNEL_INFO+=("http://${domain}|$service_name|$container_name|${container_ip}:${port}|${host_port}")
+        TUNNEL_INFO+=("http://${domain}|$service_name|$container_name|${container_ip}:${port}|${sock_path}")
     fi
 
     echo "  ✓ $service_name: http://${domain}"
@@ -428,8 +378,7 @@ EOF
 # Regenerate main Caddyfile from all active tunnel state files
 update_caddy_config() {
     local main_caddy="${CADDY_CONFIG_DIR}/Caddyfile"
-    local proxy_host=$(get_proxy_host)
-    log_verbose "Regenerating main Caddyfile at: $main_caddy (proxy_host: $proxy_host)"
+    log_verbose "Regenerating main Caddyfile at: $main_caddy"
 
     cat > "$main_caddy" <<'HEADER'
 {
@@ -443,10 +392,9 @@ HEADER
     for state_file in "${TUNNEL_STATE_DIR}"/*.json; do
         if [ -f "$state_file" ]; then
             local domain=$(grep -o '"domain": "[^"]*"' "$state_file" | cut -d'"' -f4)
-            local port=$(grep -o '"host_port": [0-9]*' "$state_file" | awk '{print $2}')
-            if [ -n "$domain" ] && [ -n "$port" ]; then
+            if [ -n "$domain" ]; then
                 echo "${domain}:80 {" >> "$main_caddy"
-                echo "    reverse_proxy ${proxy_host}:${port}" >> "$main_caddy"
+                echo "    reverse_proxy unix//sockets/${domain}.sock" >> "$main_caddy"
                 echo "    respond /health 200" >> "$main_caddy"
                 echo "}" >> "$main_caddy"
                 echo "" >> "$main_caddy"
@@ -472,29 +420,34 @@ HEADER
     fi
 }
 
-# Cleanup function
+# Cleanup function — runs on Ctrl+C, SIGTERM, AND normal exit (e.g. when all
+# SSH tunnels die because the network dropped). Disable the trap on entry so
+# the function doesn't recurse via its own `exit`.
 cleanup() {
+    trap - EXIT INT TERM
+
     echo ""
     echo "Closing all tunnels..."
 
-    # Kill all SSH tunnel processes
     for pid in "${TUNNEL_PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
         fi
     done
 
-    # Remove state files for this session
     for domain in "${TUNNEL_DOMAINS[@]}"; do
         rm -f "${TUNNEL_STATE_DIR}/${domain}.json"
+        rm -f "${SOCKET_DIR}/${domain}.sock"
     done
+
+    [ -n "${tmpfile:-}" ] && rm -f "$tmpfile"
 
     update_caddy_config
     echo "All tunnels closed."
     exit 0
 }
 
-trap cleanup INT TERM
+trap cleanup EXIT INT TERM
 
 # Ensure Caddy is running
 ensure_caddy
@@ -509,9 +462,9 @@ container_count=$(echo "$containers_data" | wc -l)
 echo "Found $container_count containers to process"
 echo ""
 
-# Process each line - use a temp file to avoid subshell issues
+# Process each line - use a temp file to avoid subshell issues.
+# tmpfile is cleaned up by cleanup() via the EXIT trap.
 tmpfile=$(mktemp "${TMPDIR:-/tmp}/worm-containers.XXXXXX")
-trap "rm -f '$tmpfile'" EXIT
 echo "$containers_data" > "$tmpfile"
 
 while IFS='|' read -r container_name service_name || [ -n "$container_name" ]; do
@@ -569,12 +522,17 @@ echo "Starting SSH tunnels..."
 tunnel_count=0
 failed_tunnels=0
 for tunnel_cmd in "${TUNNEL_CMDS[@]}"; do
-    IFS='|' read -r host_port container_ip port domain <<< "$tunnel_cmd"
-    log_verbose "Starting: ssh $SSH_ADDR -L ${host_port}:${container_ip}:${port} -N"
+    IFS='|' read -r sock_path container_ip port domain <<< "$tunnel_cmd"
+    log_verbose "Starting: ssh $SSH_ADDR -L ${sock_path}:${container_ip}:${port} -N"
 
-    # Run SSH tunnel in background
-    # Note: Don't use ControlMaster for the tunnel itself, only for command execution
-    ssh "$SSH_ADDR" -L "${host_port}:${container_ip}:${port}" -N -o "ServerAliveInterval=60" -o "ControlMaster=no" </dev/null >/dev/null 2>&1 &
+    # Run SSH tunnel in background bound to a Unix socket (not a TCP port).
+    # StreamLocalBindUnlink=yes lets ssh replace a stale socket file from a prior run.
+    ssh "$SSH_ADDR" \
+        -L "${sock_path}:${container_ip}:${port}" -N \
+        -o "ServerAliveInterval=60" \
+        -o "ControlMaster=no" \
+        -o "StreamLocalBindUnlink=yes" \
+        </dev/null >/dev/null 2>&1 &
     pid=$!
 
     # Verify tunnel started successfully
@@ -628,9 +586,9 @@ if [ "$TUNNEL_OTHER" = true ]; then
         service=$(echo "$info" | cut -d'|' -f2)
         container=$(echo "$info" | cut -d'|' -f3)
         remote=$(echo "$info" | cut -d'|' -f4)
-        host_port=$(echo "$info" | cut -d'|' -f5)
+        sock_path=$(echo "$info" | cut -d'|' -f5)
         echo "  • $url"
-        log_verbose "    Container: $container ($remote) -> localhost:$host_port"
+        log_verbose "    Container: $container ($remote) -> $sock_path"
     done
 else
     # Default tunnel info
@@ -640,11 +598,11 @@ else
         service=$(echo "$info" | cut -d'|' -f2)
         container=$(echo "$info" | cut -d'|' -f3)
         remote=$(echo "$info" | cut -d'|' -f4)
-        host_port=$(echo "$info" | cut -d'|' -f5)
+        sock_path=$(echo "$info" | cut -d'|' -f5)
         echo "✓ Tunnel active: $url"
         echo "  SSH host: $SSH_ADDR"
         echo "  Container: $container ($remote)"
-        log_verbose "  Local port: localhost:$host_port"
+        log_verbose "  Local socket: $sock_path"
     fi
 fi
 echo "========================================="

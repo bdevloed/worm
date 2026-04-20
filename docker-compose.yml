@@ -6,6 +6,7 @@ services:
     network_mode: host
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
+      - ${HOME}/.cache/worm/sockets:/sockets
       - caddy_data:/data
       - caddy_config:/config
 

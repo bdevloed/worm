@@ -7,7 +7,8 @@ mkdir -p "$CACHE_DIR"
 
 REFRESH=false
 SEARCH=""
-R_ARG=""
+R_FLAG=""
+R_VAL=""
 V_ARG=""
 O_ARG=""
 CONTAINER=""
@@ -30,7 +31,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -r|--remote-port)
-      R_ARG="-r $2"
+      R_FLAG="-r"
+      R_VAL="$2"
       shift 2
       ;;
     -c|--container)
@@ -185,14 +187,15 @@ if [[ -z "$selected_project" ]]; then
 fi
 
 # --- Step 5: Connect ---
-echo "Connecting to $selected_host, project: $selected_project ${R_ARG:+$R_ARG} ${V_ARG:+verbose mode} ${O_ARG:+choose service} ${CONTAINER:+container: $CONTAINER}"
+echo "Connecting to $selected_host, project: $selected_project ${R_FLAG:+$R_FLAG $R_VAL} ${V_ARG:+verbose mode} ${O_ARG:+choose service} ${CONTAINER:+container: $CONTAINER}"
 
-# Build args array to avoid empty string arguments
+# Build args array — flag and value MUST be separate elements so getopts in the
+# child sees them as two arguments, not one "-r 8080" string with an embedded space.
 args=()
 [[ -n "$V_ARG" ]] && args+=("$V_ARG")
 [[ -n "$O_ARG" ]] && args+=("$O_ARG")
-[[ -n "$R_ARG" ]] && args+=("$R_ARG")
+[[ -n "$R_FLAG" ]] && args+=("$R_FLAG" "$R_VAL")
 args+=("$selected_host" "$selected_project")
 [[ -n "$CONTAINER" ]] && args+=("$CONTAINER")
 
-$SCRIPT_DIR/container-tunnel-caddy "${args[@]}"
+"$SCRIPT_DIR/container-tunnel-caddy" "${args[@]}"
